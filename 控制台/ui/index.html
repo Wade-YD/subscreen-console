@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>副屏控制台</title>
+<style>
+  :root{
+    --bg:#1E1E2E; --panel:#181825; --card:#313244; --text:#CDD6F4; --sub:#6C7086;
+    --green:#A6E3A1; --red:#F38BA8; --blue:#89B4FA; --yellow:#F9E2AF; --peach:#FAB387;
+  }
+  *{box-sizing:border-box; margin:0; padding:0; font-family:'Segoe UI','Microsoft YaHei UI',sans-serif;}
+  body{background:var(--bg); color:var(--text); padding:16px 18px; user-select:none;}
+  header{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px;}
+  h1{font-size:17px; font-weight:700;}
+  .badge{font-size:11px; padding:3px 9px; border-radius:99px; background:var(--card); color:var(--sub);}
+  .badge.ddc{background:#1e3a5f; color:var(--blue);}
+  .badge.gamma{background:#3a2e1e; color:var(--peach);}
+  section{background:var(--panel); border-radius:12px; padding:14px 16px; margin-bottom:12px;}
+  .row{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:13px;}
+  .row .name{color:var(--text); font-weight:600;}
+  .row .val{color:var(--blue); font-variant-numeric:tabular-nums;}
+  input[type=range]{width:100%; height:26px; accent-color:var(--blue); cursor:pointer;}
+  #sR{accent-color:#f38ba8} #sG{accent-color:#a6e3a1} #sB{accent-color:#89b4fa}
+  button{border:0; border-radius:10px; cursor:pointer; font-family:inherit;}
+  .big{width:100%; padding:13px 0; font-size:16px; font-weight:700; color:#fff; background:var(--red); margin-top:4px;}
+  .big.off{background:var(--green);}
+  .big:disabled{opacity:.45; cursor:default;}
+  .ghost{background:var(--card); color:var(--text); font-size:12px; padding:9px 0; width:100%;}
+  .presets{display:flex; gap:8px; margin-top:12px;}
+  .presets button{flex:1; background:var(--card); color:var(--text); font-size:12px; padding:8px 0;}
+  .presets button.on{outline:2px solid var(--blue); color:var(--blue);}
+  .dev{font-size:10px; color:var(--sub); margin-top:8px; word-break:break-all; line-height:1.4;}
+  #log{font-size:11px; color:var(--yellow); min-height:16px; margin-top:8px; word-break:break-all;}
+  .hidden{display:none;}
+  .note{font-size:11px; color:var(--sub); margin-top:12px; line-height:1.5;}
+</style>
+</head>
+<body>
+<header>
+  <h1>副屏控制台</h1>
+  <span class="badge" id="engine">…</span>
+</header>
+
+<section>
+  <div class="row"><span class="name">副屏触摸</span><span class="val" id="touchState">检测中…</span></div>
+  <button class="big" id="btnTouch" disabled>…</button>
+  <div class="dev" id="touchDev"></div>
+</section>
+
+<section>
+  <div class="row"><span class="name">亮度</span><span class="val" id="vBr">100%</span></div>
+  <input type="range" id="sBr" min="10" max="100" value="100">
+  <div id="contrastBox" class="hidden">
+    <div class="row" style="margin-top:10px"><span class="name">对比度</span><span class="val" id="vCt">100%</span></div>
+    <input type="range" id="sCt" min="0" max="100" value="100">
+  </div>
+  <div id="colorBox">
+    <div class="row" style="margin-top:10px"><span class="name">红色增益</span><span class="val" id="vR">100%</span></div>
+    <input type="range" id="sR" min="40" max="100" value="100">
+    <div class="row" style="margin-top:6px"><span class="name">绿色增益</span><span class="val" id="vG">100%</span></div>
+    <input type="range" id="sG" min="40" max="100" value="100">
+    <div class="row" style="margin-top:6px"><span class="name">蓝色增益</span><span class="val" id="vB">100%</span></div>
+    <input type="range" id="sB" min="40" max="100" value="100">
+    <div class="presets" id="presets">
+      <button data-v="100,100,100" class="on">标准</button>
+      <button data-v="100,92,80">暖色</button>
+      <button data-v="100,84,62">夜览</button>
+      <button data-v="86,94,100">冷色</button>
+    </div>
+  </div>
+  <div class="note" id="engineNote"></div>
+</section>
+
+<button class="ghost" id="btnReset">恢复默认（亮度 / 色彩 100）</button>
+<div id="log"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const cur = { engine: 'gamma', values: {}, touch: [], touchSel: null };
+
+function log(m){ $('log').textContent = m || ''; }
+
+function render(){
+  const ddc = cur.engine === 'ddc';
+  const e = $('engine');
+  e.textContent = ddc ? 'DDC/CI 硬件级' : '伽马 软件级';
+  e.className = 'badge ' + (ddc ? 'ddc' : 'gamma');
+  $('engineNote').textContent = ddc
+    ? '硬件 DDC/CI 模式：调节直达显示器，与物理按键等效。'
+    : '软件伽马模式：立即生效，但属软件调光（拉很低会有轻微对比损失）；睡眠唤醒后面板每 10 秒自动补涂。';
+  $('contrastBox').classList.toggle('hidden', !ddc);
+  $('colorBox').classList.toggle('hidden', ddc);
+  const v = cur.values;
+  $('sBr').value = v.brightness; $('vBr').textContent = v.brightness + '%';
+  $('sCt').value = v.contrast;   $('vCt').textContent = v.contrast + '%';
+  $('sR').value = v.r; $('vR').textContent = v.r + '%';
+  $('sG').value = v.g; $('vG').textContent = v.g + '%';
+  $('sB').value = v.b; $('vB').textContent = v.b + '%';
+  renderTouch();
+}
+
+function renderTouch(){
+  const st = $('touchState'), btn = $('btnTouch');
+  const devs = cur.touch || [];
+  if (!devs.length){
+    st.textContent = '未找到设备'; st.style.color = 'var(--peach)';
+    btn.disabled = true; btn.textContent = '触摸开关'; btn.classList.remove('off');
+    $('touchDev').textContent = '请检查副屏 USB 线后重启面板';
+    cur.touchSel = null; return;
+  }
+  const d = devs[0];
+  cur.touchSel = d.id;
+  $('touchDev').textContent = d.id + (devs.length > 1 ? ('（共 ' + devs.length + ' 个，控制第 1 个）') : '');
+  if (d.problem && d.problem !== 0 && d.problem !== 22){
+    st.textContent = '设备异常 (' + d.problem + ')'; st.style.color = 'var(--peach)';
+    btn.disabled = true; btn.textContent = '触摸开关不可用'; btn.classList.remove('off');
+    return;
+  }
+  if (d.enabled){
+    st.textContent = '已开启'; st.style.color = 'var(--green)';
+    btn.disabled = false; btn.textContent = '关闭副屏触摸'; btn.classList.remove('off');
+  } else {
+    st.textContent = '已关闭'; st.style.color = 'var(--red)';
+    btn.disabled = false; btn.textContent = '开启副屏触摸'; btn.classList.add('off');
+  }
+}
+
+async function refresh(){
+  try {
+    const s = await pywebview.api.get_state();
+    cur.engine = s.engine; cur.values = s.values; cur.touch = s.touch;
+    render();
+  } catch(e){ log('读取状态失败: ' + e); }
+}
+
+function deb(fn, ms){ let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+function bindSlider(sid, vid, key){
+  const s = $(sid), v = $(vid);
+  s.addEventListener('input', deb(() => {
+    v.textContent = s.value + '%';
+    pywebview.api.set_value(key, +s.value).then(r => { if (!r || !r.ok) log('调节失败'); });
+  }, 140));
+}
+bindSlider('sBr','vBr','brightness');
+bindSlider('sCt','vCt','contrast');
+bindSlider('sR','vR','r'); bindSlider('sG','vG','g'); bindSlider('sB','vB','b');
+
+document.querySelectorAll('#presets button').forEach(b => {
+  b.addEventListener('click', async () => {
+    const [r, g, bb] = b.dataset.v.split(',').map(Number);
+    const res = await pywebview.api.set_values({ r: r, g: g, b: bb });
+    if (res.ok){
+      Object.assign(cur.values, res.values); render(); log('已应用预设');
+      document.querySelectorAll('#presets button').forEach(x => x.classList.toggle('on', x === b));
+    }
+  });
+});
+
+$('btnTouch').addEventListener('click', async () => {
+  if (!cur.touchSel) return;
+  const btn = $('btnTouch');
+  const enable = btn.classList.contains('off');
+  btn.disabled = true; btn.textContent = '切换中…（请在 UAC 弹窗点“是”）';
+  try {
+    const r = await pywebview.api.toggle_touch(cur.touchSel, enable);
+    cur.touch = r.touch; renderTouch();
+    log(r.msg || (r.ok ? '已切换' : '切换失败'));
+  } catch(e){ log('异常: ' + e); renderTouch(); }
+});
+
+$('btnReset').addEventListener('click', async () => {
+  const r = await pywebview.api.reset_all();
+  if (r.ok){
+    await refresh();
+    document.querySelectorAll('#presets button').forEach(x => x.classList.toggle('on', x.dataset.v === '100,100,100'));
+    log('已恢复默认');
+  }
+});
+
+window.addEventListener('pywebviewready', refresh);
+</script>
+</body>
+</html>
