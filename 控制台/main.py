@@ -545,6 +545,10 @@ class Api:
 
 def main():
     if _another_instance_running():
+        # 秒退会让用户以为启动失败; pythonw 下用 ctypes 弹窗告知
+        ctypes.windll.user32.MessageBoxW(
+            None, '副屏控制台已在运行中（请看屏幕窗口或系统托盘的月牙图标）。',
+            '副屏控制台', 0x40)
         sys.exit(0)
     api = Api()
     l, t, r, b = api.target['rect']
