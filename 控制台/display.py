@@ -2,7 +2,9 @@
 """显示器枚举 + 亮度/色彩控制: 伽马 LUT (主) 与 DDC/CI (可用时自动升级)"""
 
 import ctypes
+import math
 import time
+import winreg
 from ctypes import wintypes as wt
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -83,15 +85,66 @@ def set_gamma(hdc, ramp):
     return bool(gdi32.SetDeviceGammaRamp(hdc, (wt.WORD * 768)(*ramp)))
 
 
-def make_ramp(brightness, r=100, g=100, b=100):
-    """亮度与 RGB 增益 (0..100, 100=原样) → 768 项 LUT"""
-    br = max(0, min(100, int(brightness))) / 100.0
-    ch = [max(0, min(100, int(x))) / 100.0 for x in (r, g, b)]
+def get_kelvin_gain(kelvin):
+    """色温 (K, 2000..6500) → 归一化 RGB 增益 (最大通道=1); Tanner Helland 近似"""
+    k = max(2000.0, min(6500.0, float(kelvin)))
+    if k >= 6500.0:
+        return (1.0, 1.0, 1.0)
+    t = k / 100.0
+    # 红
+    if t <= 66.0:
+        r = 255.0
+    else:
+        r = min(255.0, max(0.0, 329.698727446 * (t - 60.0) ** -0.1332047592))
+    # 绿
+    if t <= 66.0:
+        g = 99.4708025861 * math.log(t) - 161.1195681661
+    else:
+        g = 288.1221695283 * (t - 60.0) ** -0.0755148492
+    g = min(255.0, max(0.0, g))
+    # 蓝
+    if t >= 66.0:
+        b = 255.0
+    elif t <= 19.0:
+        b = 0.0
+    else:
+        b = min(255.0, max(0.0, 138.5177312231 * math.log(t - 10.0) - 305.0447927307))
+    m = max(r, g, b)
+    return (r / m, g / m, b / m)
+
+
+def make_ramp(brightness, kelvin=6500):
+    """亮度 (1..100) 与色温 (2000..6500K) → 768 项幂曲线 LUT
+
+    模型: p = clamp(100/亮度 - 1, 0, 4); 增益 g = 亮度*(p+1)/100
+          曲线指数 e = min(p+1, 4)   (实测无特权 GDI 包络: e<=4 接受, >=4.5 拒)
+          out(i) = round(65535 * f_c * (i/255)^e),  f_c = g * gain_c
+    无特权 GDI 还有逐通道半程下限 (每通道峰值须 >= 32768): f_c < 0.501 时抬到
+    0.501 (不超过 g); 已解禁 (GdiIcmGammaRange=1) 则不抬, 保留完整色温增益
+    峰值 = 65535*g: 亮度 >= 11 时 >= 32768, 亮度 100 时为恒等 ramp
+    """
+    br = max(1, min(100, int(brightness)))
+    p = max(0.0, min(4.0, 100.0 / br - 1.0))
+    g = br * (p + 1.0) / 100.0
+    e = min(p + 1.0, 4.0)
+    floor = 0.0 if is_gdi_unlocked() else 0.501
+    kr, kg, kb = get_kelvin_gain(kelvin)
     ramp = []
-    for c in ch:
-        f = br * c
-        ramp.extend(min(65535, int(round(i * 257 * f))) for i in range(256))
+    for gain in (kr, kg, kb):
+        f = min(g, max(g * gain, floor))
+        ramp.extend(min(65535, max(0, round(65535.0 * f * (i / 255.0) ** e))) for i in range(256))
     return ramp
+
+
+def is_gdi_unlocked():
+    """注册表 GdiIcmGammaRange==1 → 已解除 SetDeviceGammaRamp 半程 (32768) 下限"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM') as key:
+            val, _typ = winreg.QueryValueEx(key, 'GdiIcmGammaRange')
+            return val == 1
+    except Exception:
+        return False
 
 
 # ---------- DDC/CI (硬件级, 屏支持时使用) ----------

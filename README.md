@@ -11,20 +11,36 @@
 | 功能 | 原理 | 权限 |
 |---|---|---|
 | 触摸开关（按屏） | `pnputil` 禁用/启用对应触摸数字化器 HID 设备 | 每次切换弹一次 UAC |
-| 亮度 | DDC/CI (VCP 0x10) 或软件伽马 LUT，启动时自动选择 | 免管理员 |
+| 亮度（幂曲线调光） | DDC/CI (VCP 0x10) 或软件伽马 LUT，启动时自动选择 | 免管理员 |
+| 色温（2000–6500K 连续调节） | Tanner Helland 黑体算法 → 通道增益，与亮度合成同一条 LUT | 免管理员 |
 | 对比度 | DDC/CI (VCP 0x12)，仅 DDC 可用时出现 | 免管理员 |
-| 色彩（R/G/B 增益 + 预设） | DDC/CI (0x16/0x18/0x1A) 或伽马通道增益 | 免管理员 |
+| 深度调光解禁（下限 1%） | 一次 UAC 写 `GdiIcmGammaRange` 注册表键（DisplayCAL 同款做法） | 单次 UAC |
+| 多显示器切换 | 下拉选择目标屏，默认非主屏 | 免管理员 |
+| 托盘常驻 / 开机自启 / 关窗最小化 | pystray + HKCU Run 键 | 免管理员 |
+| 全局热键 | `RegisterHotKey`：`Ctrl+Alt+↑/↓` 亮度±10、`←/→` 色温锚点、`M` 触摸开关、`Q` 显隐面板 | 免管理员 |
+| 夜间自动暖色 | NOAA 简化算法算日出日落，到点 10 步渐变到夜览色温 | 免管理员 |
 
 ## 快速开始
 
 ```bat
-pip install pywebview
+pip install -r 控制台\requirements.txt
 控制台\启动控制台.bat
 ```
 
 - 要求：Windows 10 2004+ / 11、Python 3.8+、WebView2 运行时（Win11 自带）
-- 窗口会自动开在副屏上
+- 关闭窗口 = 最小化到托盘（托盘菜单"退出"才是真退出）；`--hidden` 参数可静默启动
 - 零依赖备选：根目录 `TouchPanel.ps1`（v1 触摸开关面板，WPF）不需要 Python，双击 `启动面板.bat` 即用
+
+## 调光模型（软件伽马模式）
+
+Windows 对无特权进程的 `SetDeviceGammaRamp` 有两条实测约束：**单通道峰值 `out[255] ≥ 32768`**，且**陡曲线不允许峰值缩水**（幂指数 >4 拒绝；峰值打折的陡曲线也拒绝）。据此：
+
+- 调光用幂曲线：`p = clamp(100/亮度 − 1, 0, 4)`，平均亮度 = 设定值，100→50→30→20% 平滑可达
+- **未解禁时亮度下限 20%**（实测 b≤19 一律被 GDI 静默拒绝）
+- 想调到 1%（接近全黑）：点面板"解锁深度调光"，一次 UAC 写 `HKLM\...\ICM\GdiIcmGammaRange=1` 后解除约束（单屏生效，DisplayCAL 等校色工具同款做法）
+- 色温增益归一化后，暗通道同样受峰值约束——无特权时低色温的蓝通道被自动抬底保护，解禁后保留完整增益
+- 每次写入都检查返回值，被拒时 UI 明示（绝不再假装调上了）
+- 睡眠唤醒/切分辨率后系统会重置 LUT，面板 watchdog 每 10 秒比对补涂
 
 ## 适配你自己的屏
 
@@ -64,9 +80,11 @@ schtasks /Run /TN TouchToggle
 ├─ 启动面板.bat           v1 启动器（弹 UAC）
 ├─ 免UAC启动.bat          v1 免 UAC 启动（需先注册上面的计划任务）
 └─ 控制台/               v2 主程序（pywebview）
-   ├─ main.py            入口 + js_api + 注册表持久化 + DDC/伽马引擎选择
-   ├─ display.py         显示器枚举 / 伽马 LUT / DDC/CI（ctypes 直调）
+   ├─ main.py            入口 + js_api + 注册表持久化 + 托盘/热键/自启/夜间暖色
+   ├─ display.py         显示器枚举 / 幂曲线伽马 LUT + 开尔文色温 / DDC/CI（ctypes 直调）
    ├─ touchctl.py        触摸设备枚举（cfgmgr32）与切换（runas + pnputil）
+   ├─ sunset.py          NOAA 简化日出日落计算（纯标准库）
+   ├─ requirements.txt   pywebview / pystray / pillow
    ├─ ui/index.html      界面
    └─ 启动控制台.bat      启动器
 ```

@@ -15,12 +15,21 @@
   .badge{font-size:11px; padding:3px 9px; border-radius:99px; background:var(--card); color:var(--sub);}
   .badge.ddc{background:#1e3a5f; color:var(--blue);}
   .badge.gamma{background:#3a2e1e; color:var(--peach);}
+  .dispBar{margin-bottom:12px;}
+  .dispBar select{width:100%; padding:9px 10px; border-radius:10px; border:0; background:var(--card);
+    color:var(--text); font-family:inherit; font-size:12px; outline:none; cursor:pointer;}
   section{background:var(--panel); border-radius:12px; padding:14px 16px; margin-bottom:12px;}
   .row{display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; font-size:13px;}
   .row .name{color:var(--text); font-weight:600;}
   .row .val{color:var(--blue); font-variant-numeric:tabular-nums;}
+  .switches{display:flex; align-items:center; gap:16px; flex-wrap:wrap; font-size:12px;}
+  .switches label{display:flex; align-items:center; gap:6px; cursor:pointer;}
+  .switches input[type=checkbox]{accent-color:var(--blue); width:15px; height:15px; cursor:pointer;}
+  #btnUnlock{border:0; border-radius:10px; background:var(--card); color:var(--text);
+    font-size:11px; padding:7px 12px; margin-left:auto; cursor:pointer; font-family:inherit;}
+  #btnUnlock:disabled{opacity:.45; cursor:default;}
   input[type=range]{width:100%; height:26px; accent-color:var(--blue); cursor:pointer;}
-  #sR{accent-color:#f38ba8} #sG{accent-color:#a6e3a1} #sB{accent-color:#89b4fa}
+  #sK{accent-color:var(--peach);}
   button{border:0; border-radius:10px; cursor:pointer; font-family:inherit;}
   .big{width:100%; padding:13px 0; font-size:16px; font-weight:700; color:#fff; background:var(--red); margin-top:4px;}
   .big.off{background:var(--green);}
@@ -41,6 +50,18 @@
   <span class="badge" id="engine">…</span>
 </header>
 
+<div class="dispBar">
+  <select id="dispSel"><option>加载中…</option></select>
+</div>
+
+<section>
+  <div class="switches">
+    <label><input type="checkbox" id="ckAuto">开机自启</label>
+    <label><input type="checkbox" id="ckNight">夜间自动暖色</label>
+    <button id="btnUnlock">解锁深度调光（UAC）</button>
+  </div>
+</section>
+
 <section>
   <div class="row"><span class="name">副屏触摸</span><span class="val" id="touchState">检测中…</span></div>
   <button class="big" id="btnTouch" disabled>…</button>
@@ -49,34 +70,33 @@
 
 <section>
   <div class="row"><span class="name">亮度</span><span class="val" id="vBr">100%</span></div>
-  <input type="range" id="sBr" min="10" max="100" value="100">
+  <input type="range" id="sBr" min="20" max="100" value="100">
   <div id="contrastBox" class="hidden">
     <div class="row" style="margin-top:10px"><span class="name">对比度</span><span class="val" id="vCt">100%</span></div>
     <input type="range" id="sCt" min="0" max="100" value="100">
   </div>
   <div id="colorBox">
-    <div class="row" style="margin-top:10px"><span class="name">红色增益</span><span class="val" id="vR">100%</span></div>
-    <input type="range" id="sR" min="40" max="100" value="100">
-    <div class="row" style="margin-top:6px"><span class="name">绿色增益</span><span class="val" id="vG">100%</span></div>
-    <input type="range" id="sG" min="40" max="100" value="100">
-    <div class="row" style="margin-top:6px"><span class="name">蓝色增益</span><span class="val" id="vB">100%</span></div>
-    <input type="range" id="sB" min="40" max="100" value="100">
+    <div class="row" style="margin-top:10px"><span class="name">色温</span><span class="val" id="vK">6500K</span></div>
+    <input type="range" id="sK" min="2000" max="6500" step="50" value="6500">
     <div class="presets" id="presets">
-      <button data-v="100,100,100" class="on">标准</button>
-      <button data-v="100,92,80">暖色</button>
-      <button data-v="100,84,62">夜览</button>
-      <button data-v="86,94,100">冷色</button>
+      <button data-k="6500" class="on">标准</button>
+      <button data-k="4500">暖色</button>
+      <button data-k="3400">夜览</button>
+      <button data-k="2000">烛光</button>
     </div>
   </div>
   <div class="note" id="engineNote"></div>
 </section>
 
-<button class="ghost" id="btnReset">恢复默认（亮度 / 色彩 100）</button>
+<button class="ghost" id="btnReset">恢复默认（亮度 100 / 色温 6500K）</button>
 <div id="log"></div>
+<div class="note">热键（全局）：Ctrl+Alt+↑/↓ 亮度 ±10 · Ctrl+Alt+←/→ 色温 · Ctrl+Alt+M 触摸开关 · Ctrl+Alt+Q 显示/隐藏面板。关闭窗口 = 最小化到托盘。</div>
 
 <script>
 const $ = id => document.getElementById(id);
-const cur = { engine: 'gamma', values: {}, touch: [], touchSel: null };
+const cur = { engine: 'gamma', values: {}, touch: [], touchSel: null,
+              gdi_unlocked: false, apply_ok: true };
+const WARN = '⚠ 系统拒绝了本次伽马写入，已回退显示';
 
 function log(m){ $('log').textContent = m || ''; }
 
@@ -86,17 +106,34 @@ function render(){
   e.textContent = ddc ? 'DDC/CI 硬件级' : '伽马 软件级';
   e.className = 'badge ' + (ddc ? 'ddc' : 'gamma');
   $('engineNote').textContent = ddc
-    ? '硬件 DDC/CI 模式：调节直达显示器，与物理按键等效。'
+    ? '硬件 DDC/CI 模式：调节直达显示器，与物理按键等效；色温映射为 RGB 增益。'
     : '软件伽马模式：立即生效，但属软件调光（拉很低会有轻微对比损失）；睡眠唤醒后面板每 10 秒自动补涂。';
   $('contrastBox').classList.toggle('hidden', !ddc);
   $('colorBox').classList.toggle('hidden', ddc);
   const v = cur.values;
+  $('sBr').min = cur.gdi_unlocked ? 1 : 20;   // 亮度下限: 未解禁 20 (实测 b≤19 被 GDI 拒), 解禁后 1
   $('sBr').value = v.brightness; $('vBr').textContent = v.brightness + '%';
   $('sCt').value = v.contrast;   $('vCt').textContent = v.contrast + '%';
-  $('sR').value = v.r; $('vR').textContent = v.r + '%';
-  $('sG').value = v.g; $('vG').textContent = v.g + '%';
-  $('sB').value = v.b; $('vB').textContent = v.b + '%';
+  $('sK').value = v.kelvin;      $('vK').textContent = (v.kelvin || 6500) + 'K';
+  document.querySelectorAll('#presets button').forEach(b =>
+    b.classList.toggle('on', +b.dataset.k === v.kelvin));
+  $('ckNight').checked = !!v.night_mode;
+  const u = $('btnUnlock');
+  if (cur.gdi_unlocked){ u.disabled = true; u.textContent = '已解锁'; }
+  else { u.disabled = false; u.textContent = '解锁深度调光（UAC）'; }
   renderTouch();
+}
+
+function renderDisplays(s){
+  const sel = $('dispSel');
+  sel.innerHTML = '';
+  (s.displays || []).forEach(d => {
+    const o = document.createElement('option');
+    o.value = d.device;
+    o.textContent = (d.primary ? '主屏 ' : '副屏 ') + d.device.replace('\\\\.\\', '');
+    sel.appendChild(o);
+  });
+  if (s.target_device) sel.value = s.target_device;
 }
 
 function renderTouch(){
@@ -128,31 +165,42 @@ function renderTouch(){
 async function refresh(){
   try {
     const s = await pywebview.api.get_state();
-    cur.engine = s.engine; cur.values = s.values; cur.touch = s.touch;
+    cur.engine = s.engine; cur.values = s.values || {}; cur.touch = s.touch;
+    cur.gdi_unlocked = !!s.gdi_unlocked; cur.apply_ok = s.apply_ok;
+    renderDisplays(s);
     render();
+    if (s.apply_ok === false) log(WARN);
+    else if ($('log').textContent === WARN) log('');
   } catch(e){ log('读取状态失败: ' + e); }
 }
+window.__sync = refresh;   // 供热键线程 evaluate_js 同步 UI
 
 function deb(fn, ms){ let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 function bindSlider(sid, vid, key){
   const s = $(sid), v = $(vid);
   s.addEventListener('input', deb(() => {
     v.textContent = s.value + '%';
-    pywebview.api.set_value(key, +s.value).then(r => { if (!r || !r.ok) log('调节失败'); });
+    pywebview.api.set_value(key, +s.value).then(r => {
+      if (!r || !r.ok) log('调节失败');
+      else if (r.apply_ok === false) log(WARN);
+    });
   }, 140));
 }
 bindSlider('sBr','vBr','brightness');
 bindSlider('sCt','vCt','contrast');
-bindSlider('sR','vR','r'); bindSlider('sG','vG','g'); bindSlider('sB','vB','b');
+
+$('sK').addEventListener('input', deb(() => {
+  $('vK').textContent = $('sK').value + 'K';
+  pywebview.api.set_value('kelvin', +$('sK').value).then(r => {
+    if (!r || !r.ok) log('调节失败');
+    else if (r.apply_ok === false) log(WARN);
+  });
+}, 140));
 
 document.querySelectorAll('#presets button').forEach(b => {
   b.addEventListener('click', async () => {
-    const [r, g, bb] = b.dataset.v.split(',').map(Number);
-    const res = await pywebview.api.set_values({ r: r, g: g, b: bb });
-    if (res.ok){
-      Object.assign(cur.values, res.values); render(); log('已应用预设');
-      document.querySelectorAll('#presets button').forEach(x => x.classList.toggle('on', x === b));
-    }
+    const res = await pywebview.api.set_value('kelvin', +b.dataset.k);
+    if (res && res.ok){ await refresh(); log('已应用色温 ' + b.dataset.k + 'K'); }
   });
 });
 
@@ -170,11 +218,41 @@ $('btnTouch').addEventListener('click', async () => {
 
 $('btnReset').addEventListener('click', async () => {
   const r = await pywebview.api.reset_all();
-  if (r.ok){
+  if (r.ok){ await refresh(); log('已恢复默认'); }
+});
+
+$('ckAuto').addEventListener('change', async () => {
+  const want = $('ckAuto').checked;
+  try {
+    const r = await pywebview.api.set_autostart(want);
+    if (!r || !r.ok){ $('ckAuto').checked = !!(r && r.autostart); log('开机自启设置失败'); }
+    else { $('ckAuto').checked = !!r.autostart; log(r.autostart ? '已开启开机自启' : '已关闭开机自启'); }
+  } catch(e){ $('ckAuto').checked = !want; log('异常: ' + e); }
+});
+
+$('ckNight').addEventListener('change', async () => {
+  try {
+    const r = await pywebview.api.set_night_mode($('ckNight').checked);
+    if (r && r.ok) log(r.night_mode ? '夜间自动暖色已开启（日落后自动切换到夜览色温）' : '夜间自动暖色已关闭');
+  } catch(e){ log('异常: ' + e); }
+});
+
+$('btnUnlock').addEventListener('click', async () => {
+  const u = $('btnUnlock');
+  u.disabled = true; u.textContent = '等待 UAC 确认…';
+  try {
+    const r = await pywebview.api.unlock_gdi();
     await refresh();
-    document.querySelectorAll('#presets button').forEach(x => x.classList.toggle('on', x.dataset.v === '100,100,100'));
-    log('已恢复默认');
-  }
+    log(r && r.ok ? '深度调光已解锁（亮度下限 1%）' : '未解锁（已取消或失败）');
+  } catch(e){ await refresh(); log('异常: ' + e); }
+});
+
+$('dispSel').addEventListener('change', async () => {
+  try {
+    const r = await pywebview.api.select_display($('dispSel').value);
+    if (r && r.ok){ await refresh(); log('已切换控制目标'); }
+    else log((r && r.msg) || '切换失败');
+  } catch(e){ log('异常: ' + e); }
 });
 
 window.addEventListener('pywebviewready', refresh);
