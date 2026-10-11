@@ -38,6 +38,7 @@ CFG = {'touch_hwid': 'VID_1A86&PID_E5E3', 'gamma_watchdog_sec': 10}
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 _adv = ctypes.WinDLL('advapi32', use_last_error=True)
+shell32 = ctypes.WinDLL('shell32', use_last_error=True)
 _REG_PATH = r'Software\副屏控制台'
 _KEY_WRITE = 0x20006
 _KEY_READ = 0x20019
@@ -60,11 +61,15 @@ user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT
 
 _RUN_KEY = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
 _RUN_VALUE = 'SubScreenConsole'
-# 调光双模式: GDI 对 ramp 有每点偏离 identity 上限 (~±32768), 由此可证单调 ramp
-# 白位下限 = 50% 是数学硬墙 → 50-100% 可做纯线性 (零畸变); 更暗必须幂曲线压中间调 (有灰阶压缩)。
-# GdiIcmGammaRange 后门在 Win11 build 26300 实测无效 (OSD 重置前后/重启后写入均被拒), 已移除。
-_BR_MIN_QUALITY = 50   # 画质优先 (线性) 模式下限
-_BR_MIN_DEEP = 25      # 深度调暗 (幂曲线) 模式下限: 20-25 为 e 钳位死区, 取 25
+# 调光双模式: GDI 对 ramp 有每点偏离 identity 上限的校验, 由此可证单调 ramp 白位下限
+# = 50% 是数学硬墙 → 50-100% 纯线性 (零畸变), 更暗须幂曲线压中间调。
+# 写 HKLM GdiIcmGammaRange = 0x100 (f.lux/DisplayCAL 同款) 放宽校验 → 线性全域 1-100%,
+# 重启会话后生效。注意语义并非开关: 写 1 会把容差锁死到 ~1% (实测), 必须用 0x100。
+_ICM_REG_ADD = (r'add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM"'
+                r' /v GdiIcmGammaRange /t REG_DWORD /d 256 /f')
+_BR_MIN_QUALITY = 50          # 画质优先 (线性) 未解锁下限
+_BR_MIN_QUALITY_UNLOCKED = 1  # 0x100 解锁后的画质优先下限 (全域零畸变)
+_BR_MIN_DEEP = 25             # 深度调暗 (幂曲线) 下限: 20-25 为 e 钳位死区, 取 25
 _DIM_MODES = ('quality', 'deep')
 _KELVIN_ANCHORS = [6500, 5000, 4500, 4000, 3400, 2700]  # 热键 ←→ 步进锚点
 _NIGHT_KELVIN = 3400
@@ -136,7 +141,8 @@ class Api:
         self.apply_ok = True
         self.hotkeys_ok = False  # 热键线程注册完成后置真值; 全部失败时 get_state 上报供 UI 提示
         self._fade_token = 0     # 夜间渐变代际号: 递增即取消进行中的渐变, 防两条渐变交错
-        self.dim_mode = 'deep'   # 'quality'=线性零畸变 (50-100) / 'deep'=幂曲线可调暗 (25-100); _load 恢复
+        self.dim_mode = 'deep'   # 'quality'=线性零畸变 / 'deep'=幂曲线可调暗; _load 恢复
+        self._gdi_unlocked = bool(display.is_gdi_unlocked())  # 0x100 解锁 → quality 下限 1%
         self._night_applied = None
         self._hidden = False
         self._exiting = False
@@ -214,10 +220,13 @@ class Api:
 
     # ---------- 应用 ----------
     def _br_min(self):
-        """亮度下限: DDC 引擎不受 GDI 限制 → 0; 伽马引擎由调光模式决定 (50%/25% 均为包络硬墙)"""
+        """亮度下限: DDC 引擎不受 GDI 限制 → 0; 伽马引擎按模式:
+        quality 线性 50% (未解锁) / 1% (0x100 解锁); deep 幂曲线 25% (e 钳位死区)"""
         if self.engine == 'ddc':
             return 0
-        return _BR_MIN_QUALITY if self.dim_mode == 'quality' else _BR_MIN_DEEP
+        if self.dim_mode == 'quality':
+            return _BR_MIN_QUALITY_UNLOCKED if self._gdi_unlocked else _BR_MIN_QUALITY
+        return _BR_MIN_DEEP
 
     def _gamma_ramp_mode(self):
         """dim_mode → make_ramp 的 mode 参数"""
@@ -491,6 +500,7 @@ class Api:
                     'values': dict(self.values),
                     'apply_ok': bool(self.apply_ok),
                     'dim_mode': self.dim_mode,
+                    'gdi_unlocked': self._gdi_unlocked,
                     'br_min': self._br_min(),
                     'hotkeys_ok': bool(self.hotkeys_ok),
                     'monitor': {'device': self.target['device'], 'rect': self.target['rect']},
@@ -545,7 +555,7 @@ class Api:
         return {'ok': True, 'state': self.get_state()}
 
     def set_dim_mode(self, mode):
-        """切换调光模式: 'quality'=线性零畸变 (下限 50%) / 'deep'=幂曲线可调暗 (下限 25%)
+        """切换调光模式: 'quality'=线性零畸变 / 'deep'=幂曲线可调暗
         模式间画面观感不同 (同为 60% 时画质模式更暗更素), 切换即应用并持久化"""
         if mode not in _DIM_MODES:
             return {'ok': False}
@@ -556,6 +566,24 @@ class Api:
         self._save()
         self._sync_ui()
         return {'ok': True, 'apply_ok': bool(ok), 'dim_mode': mode}
+
+    def unlock_gdi(self):
+        """UAC 写 HKLM GdiIcmGammaRange=0x100 (f.lux/DisplayCAL 同款) 放宽 GDI ramp
+        偏离校验 → 画质优先 (线性) 模式下限 50%→1%, 全域零畸变; 重启会话后生效"""
+        if not self._gdi_unlocked and not display.is_gdi_unlocked():
+            rc = shell32.ShellExecuteW(None, 'runas', 'reg.exe', _ICM_REG_ADD, None, 0)
+            if rc <= 32:
+                return {'ok': False, 'unlocked': display.is_gdi_unlocked(),
+                        'msg': '提权被取消或失败'}
+            # reg.exe 异步 → 轮询复核注册表写入 (最多 15×200ms)
+            for _ in range(15):
+                time.sleep(0.2)
+                if display.is_gdi_unlocked():
+                    break
+        with self.lock:
+            self._gdi_unlocked = bool(display.is_gdi_unlocked())
+        return {'ok': self._gdi_unlocked, 'unlocked': self._gdi_unlocked,
+                'msg': '已写入解锁键，重启 Windows 后生效' if self._gdi_unlocked else '写入未生效'}
 
     def set_autostart(self, enable):
         if enable:

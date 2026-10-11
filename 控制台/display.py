@@ -4,7 +4,24 @@
 import ctypes
 import math
 import time
+import winreg
 from ctypes import wintypes as wt
+
+# GdiIcmGammaRange 标准解锁值 (f.lux / DisplayCAL / QDSpy 同款):
+# GDI 对 ramp 有每点偏离 identity 上限的校验, 该键放宽之; 语义上并非开关——
+# 写 1 反而把容差锁死到 ~1% (实测), 写 0x100 放开全域, 需重启 win32k 会话生效
+_GDI_UNLOCK_THRESHOLD = 0x100
+
+
+def is_gdi_unlocked():
+    """HKLM GdiIcmGammaRange >= 0x100 → GDI ramp 校验已放宽 (重启会话后生效)"""
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM') as key:
+            val, _typ = winreg.QueryValueEx(key, 'GdiIcmGammaRange')
+            return val >= _GDI_UNLOCK_THRESHOLD
+    except Exception:
+        return False
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 gdi32 = ctypes.WinDLL('gdi32', use_last_error=True)
@@ -112,30 +129,40 @@ def get_kelvin_gain(kelvin):
     return (r / m, g / m, b / m)
 
 
+def _floor_min(e):
+    """GDI 逐点偏离校验 (每点 |out−identity| ≤ ~0.5 满幅) 下, 幂曲线 out=f·x^e 的
+    通道乘子 f 安全下限。最大偏离不在白位 (x=1) 而在中段极值点, 白位 0.501 抬底
+    只保护白位不保护中段 (e=4 时中段需要 f≥0.844)。闭式解: f·e·x^(e−1)=1 的
+    极值点代入, 解 |f·x*^e − x*| = 0.5 得 f_min = 1/(e·(e/(2(e−1)))^(e−1))"""
+    if e <= 1:
+        return 0.5
+    return 1.0 / (e * (e / (2.0 * (e - 1.0))) ** (e - 1.0))
+
+
 def make_ramp(brightness, kelvin=6500, mode='power'):
     """亮度 (1..100) 与色温 (2000..6500K) → 768 项 LUT
 
-    mode='linear' (需 GdiIcmGammaRange 已在本会话生效): e=1, g=亮度/100 ——
-          白位=设定值 (背光语义), 黑位不动, 灰阶等比缩放 → 不动对比度
-    mode='power' (未解禁/键未生效会话的回退): 幂曲线保"白位恒满 65535" ——
-          GDI 对 ramp 有每点偏离 identity 上限 (~±32768) 的校验: 白位降到半程
-          以下即触限被拒, 只能压中间调, 代价是暗部压缩的对比感损失;
-          f_c < 0.501 逐通道抬底 (不超过 g)
+    mode='linear' (画质优先): e=1, g=亮度/100 —— 白位=设定值 (背光语义), 黑位不动,
+          灰阶等比缩放 → 不动对比度; 下限 50% (白位半程是偏离校验的数学硬墙)
+    mode='power' (深度调暗): 幂曲线保"白位恒满 65535" —— 只能压中间调,
+          代价是暗部压缩的对比感损失; 下限 25% (e 钳位死区)
     out(i) = round(65535 * f_c * (i/255)^e), f_c = g * gain_c
+    通道乘子统一钳底: f_c = min(g, max(g·gain_c, _floor_min(e))) —— 同时保证
+    白位与中段都满足 GDI 逐点偏离校验; 副作用是暖色温的冷通道被抬底 (色温偏冷),
+    这是 ±50% 包络内的物理极限, 并非 bug
     """
     br = max(1, min(100, int(brightness)))
     if mode == 'linear':
         e = 1.0
         g = br / 100.0
-        floor = 0.0
     else:
         e = min(100.0 / br, 4.0)
         g = 1.0
-        floor = 0.501
+    fmin = _floor_min(e)
     kr, kg, kb = get_kelvin_gain(kelvin)
     ramp = []
     for gain in (kr, kg, kb):
-        f = min(g, max(g * gain, floor))
+        f = min(g, max(g * gain, fmin))
         ramp.extend(min(65535, max(0, round(65535.0 * f * (i / 255.0) ** e))) for i in range(256))
     return ramp
 

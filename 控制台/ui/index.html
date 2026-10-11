@@ -59,8 +59,9 @@
   </div>
   <div class="row" style="margin-top:10px"><span class="name">调光模式</span><span class="val" style="font-size:11px" id="dimHint"></span></div>
   <div class="presets" id="dimModes">
-    <button data-m="quality">画质优先（50–100%）</button>
-    <button data-m="deep">深度调暗（25–100%）</button>
+    <button data-m="quality">画质优先</button>
+    <button data-m="deep">深度调暗</button>
+    <button id="btnUnlock">解锁全域调光</button>
   </div>
 </section>
 
@@ -110,13 +111,19 @@ function render(){
   $('engineNote').textContent = ddc
     ? '硬件 DDC/CI 模式：调节直达显示器，与物理按键等效；色温映射为 RGB 增益。'
     : (cur.dim_mode === 'quality'
-      ? '画质优先：纯线性等比调光，灰阶层次完全不变（不动对比度），下限 50%。'
+      ? '画质优先：纯线性等比调光，灰阶层次完全不变（不动对比度）。'
       : '深度调暗：幂曲线压中间调，可调到 25%，但中暗部灰阶有压缩（对比感略降）。');
   $('dimHint').textContent = ddc ? '（仅伽马模式需要选择）' : '';
   document.querySelectorAll('#dimModes button').forEach(b => {
     b.classList.toggle('on', b.dataset.m === cur.dim_mode);
     b.disabled = ddc;
   });
+  // 画质优先按钮文案随下限动态化 (解锁 0x100 后 1–100%, 否则 50–100%)
+  const qBtn = document.querySelector('#dimModes button[data-m=quality]');
+  if (qBtn) qBtn.textContent = '画质优先（' + cur.br_min + '–100%）';
+  const u = $('btnUnlock');
+  if (cur.gdi_unlocked){ u.disabled = true; u.textContent = '已解锁全域'; }
+  else { u.disabled = false; u.textContent = '解锁全域调光（UAC）'; }
   $('contrastBox').classList.toggle('hidden', !ddc);
   $('colorBox').classList.toggle('hidden', ddc);
   const v = cur.values;
@@ -176,8 +183,9 @@ async function refresh(){
     cur.engine = s.engine; cur.values = s.values || {}; cur.touch = s.touch;
     cur.apply_ok = s.apply_ok;
     cur.dim_mode = (s.dim_mode === 'quality') ? 'quality' : 'deep';
+    cur.gdi_unlocked = !!s.gdi_unlocked;
     cur.hotkeys_ok = s.hotkeys_ok !== false;
-    cur.br_min = (typeof s.br_min === 'number') ? s.br_min : (cur.dim_mode === 'quality' ? 50 : 25);
+    cur.br_min = (typeof s.br_min === 'number') ? s.br_min : (cur.dim_mode === 'quality' ? (cur.gdi_unlocked ? 1 : 50) : 25);
     renderDisplays(s);
     render();
     if (s.apply_ok === false) log(WARN);
@@ -248,7 +256,7 @@ $('ckNight').addEventListener('change', async () => {
   } catch(e){ log('异常: ' + e); }
 });
 
-document.querySelectorAll('#dimModes button').forEach(b => {
+document.querySelectorAll('#dimModes button[data-m]').forEach(b => {
   b.addEventListener('click', async () => {
     if (b.dataset.m === cur.dim_mode) return;
     try {
@@ -256,11 +264,21 @@ document.querySelectorAll('#dimModes button').forEach(b => {
       if (r && r.ok){
         await refresh();
         log(r.dim_mode === 'quality'
-          ? '已切换画质优先：等比调光不动对比度，下限 50%'
+          ? '已切换画质优先：等比调光不动对比度，下限 ' + cur.br_min + '%'
           : '已切换深度调暗：可调到 25%，中暗部灰阶有压缩');
       }
     } catch(e){ log('异常: ' + e); }
   });
+});
+
+$('btnUnlock').addEventListener('click', async () => {
+  const u = $('btnUnlock');
+  u.disabled = true; u.textContent = '等待 UAC 确认…';
+  try {
+    const r = await pywebview.api.unlock_gdi();
+    await refresh();
+    log(r && r.ok ? '解锁键已写入：重启 Windows 后画质优先即可全域 1–100%' : (r && r.msg) || '未写入');
+  } catch(e){ await refresh(); log('异常: ' + e); }
 });
 
 $('dispSel').addEventListener('change', async () => {
