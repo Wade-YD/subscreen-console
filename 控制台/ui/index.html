@@ -25,9 +25,6 @@
   .switches{display:flex; align-items:center; gap:16px; flex-wrap:wrap; font-size:12px;}
   .switches label{display:flex; align-items:center; gap:6px; cursor:pointer;}
   .switches input[type=checkbox]{accent-color:var(--blue); width:15px; height:15px; cursor:pointer;}
-  #btnUnlock{border:0; border-radius:10px; background:var(--card); color:var(--text);
-    font-size:11px; padding:7px 12px; margin-left:auto; cursor:pointer; font-family:inherit;}
-  #btnUnlock:disabled{opacity:.45; cursor:default;}
   input[type=range]{width:100%; height:26px; accent-color:var(--blue); cursor:pointer;}
   #sK{accent-color:var(--peach);}
   button{border:0; border-radius:10px; cursor:pointer; font-family:inherit;}
@@ -59,7 +56,11 @@
   <div class="switches">
     <label><input type="checkbox" id="ckAuto">开机自启</label>
     <label><input type="checkbox" id="ckNight">夜间自动暖色</label>
-    <button id="btnUnlock">解锁深度调光（UAC）</button>
+  </div>
+  <div class="row" style="margin-top:10px"><span class="name">调光模式</span><span class="val" style="font-size:11px" id="dimHint"></span></div>
+  <div class="presets" id="dimModes">
+    <button data-m="quality">画质优先（50–100%）</button>
+    <button data-m="deep">深度调暗（25–100%）</button>
   </div>
 </section>
 
@@ -96,7 +97,7 @@
 <script>
 const $ = id => document.getElementById(id);
 const cur = { engine: 'gamma', values: {}, touch: [], touchSel: null,
-              gdi_unlocked: false, apply_ok: true, hotkeys_ok: true, br_min: 1 };
+              apply_ok: true, hotkeys_ok: true, br_min: 25, dim_mode: 'deep' };
 const WARN = '⚠ 系统拒绝了本次伽马写入，已回退显示';
 
 function log(m){ $('log').textContent = m || ''; }
@@ -108,7 +109,14 @@ function render(){
   e.className = 'badge ' + (ddc ? 'ddc' : 'gamma');
   $('engineNote').textContent = ddc
     ? '硬件 DDC/CI 模式：调节直达显示器，与物理按键等效；色温映射为 RGB 增益。'
-    : '软件伽马模式：立即生效，但属软件调光（拉很低会有轻微对比损失）；睡眠唤醒后面板每 10 秒自动补涂。';
+    : (cur.dim_mode === 'quality'
+      ? '画质优先：纯线性等比调光，灰阶层次完全不变（不动对比度），下限 50%。'
+      : '深度调暗：幂曲线压中间调，可调到 25%，但中暗部灰阶有压缩（对比感略降）。');
+  $('dimHint').textContent = ddc ? '（仅伽马模式需要选择）' : '';
+  document.querySelectorAll('#dimModes button').forEach(b => {
+    b.classList.toggle('on', b.dataset.m === cur.dim_mode);
+    b.disabled = ddc;
+  });
   $('contrastBox').classList.toggle('hidden', !ddc);
   $('colorBox').classList.toggle('hidden', ddc);
   const v = cur.values;
@@ -119,9 +127,6 @@ function render(){
   document.querySelectorAll('#presets button').forEach(b =>
     b.classList.toggle('on', +b.dataset.k === v.kelvin));
   $('ckNight').checked = !!v.night_mode;
-  const u = $('btnUnlock');
-  if (cur.gdi_unlocked){ u.disabled = true; u.textContent = '已解锁'; }
-  else { u.disabled = false; u.textContent = '解锁深度调光（UAC）'; }
   $('hotkeyWarn').textContent = cur.hotkeys_ok === false
     ? '⚠ 全局热键注册失败（可能被核显驱动等占用）' : '';
   renderTouch();
@@ -169,9 +174,10 @@ async function refresh(){
   try {
     const s = await pywebview.api.get_state();
     cur.engine = s.engine; cur.values = s.values || {}; cur.touch = s.touch;
-    cur.gdi_unlocked = !!s.gdi_unlocked; cur.apply_ok = s.apply_ok;
+    cur.apply_ok = s.apply_ok;
+    cur.dim_mode = (s.dim_mode === 'quality') ? 'quality' : 'deep';
     cur.hotkeys_ok = s.hotkeys_ok !== false;
-    cur.br_min = (typeof s.br_min === 'number') ? s.br_min : 1;
+    cur.br_min = (typeof s.br_min === 'number') ? s.br_min : (cur.dim_mode === 'quality' ? 50 : 25);
     renderDisplays(s);
     render();
     if (s.apply_ok === false) log(WARN);
@@ -242,14 +248,19 @@ $('ckNight').addEventListener('change', async () => {
   } catch(e){ log('异常: ' + e); }
 });
 
-$('btnUnlock').addEventListener('click', async () => {
-  const u = $('btnUnlock');
-  u.disabled = true; u.textContent = '等待 UAC 确认…';
-  try {
-    const r = await pywebview.api.unlock_gdi();
-    await refresh();
-    log(r && r.ok ? '深度调光已解锁（亮度下限 1%）' : '未解锁（已取消或失败）');
-  } catch(e){ await refresh(); log('异常: ' + e); }
+document.querySelectorAll('#dimModes button').forEach(b => {
+  b.addEventListener('click', async () => {
+    if (b.dataset.m === cur.dim_mode) return;
+    try {
+      const r = await pywebview.api.set_dim_mode(b.dataset.m);
+      if (r && r.ok){
+        await refresh();
+        log(r.dim_mode === 'quality'
+          ? '已切换画质优先：等比调光不动对比度，下限 50%'
+          : '已切换深度调暗：可调到 25%，中暗部灰阶有压缩');
+      }
+    } catch(e){ log('异常: ' + e); }
+  });
 });
 
 $('dispSel').addEventListener('change', async () => {

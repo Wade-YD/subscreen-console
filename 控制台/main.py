@@ -37,7 +37,6 @@ CFG = {'touch_hwid': 'VID_1A86&PID_E5E3', 'gamma_watchdog_sec': 10}
 
 kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
 user32 = ctypes.WinDLL('user32', use_last_error=True)
-shell32 = ctypes.WinDLL('shell32', use_last_error=True)
 _adv = ctypes.WinDLL('advapi32', use_last_error=True)
 _REG_PATH = r'Software\副屏控制台'
 _KEY_WRITE = 0x20006
@@ -61,11 +60,12 @@ user32.GetMessageW.argtypes = [ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT
 
 _RUN_KEY = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
 _RUN_VALUE = 'SubScreenConsole'
-_ICM_REG_ADD = (r'add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM"'
-                r' /v GdiIcmGammaRange /t REG_DWORD /d 1 /f')
-_BR_MIN_LOCKED = 25    # 未解禁亮度下限: GDI 两约束 (峰值≥32768、陡曲线不允许峰值缩水) 使 b≤19 被拒;
-                       # 且亮度 20~24 区间 e 被 min(p+1,4) 钳到 4、g 恒 1, ramp 与 25 完全相同 (死区), b≥26 起才有变化, 故取 25
-_BR_MIN_UNLOCKED = 1   # HKLM GdiIcmGammaRange=1 解禁后的下限
+# 调光双模式: GDI 对 ramp 有每点偏离 identity 上限 (~±32768), 由此可证单调 ramp
+# 白位下限 = 50% 是数学硬墙 → 50-100% 可做纯线性 (零畸变); 更暗必须幂曲线压中间调 (有灰阶压缩)。
+# GdiIcmGammaRange 后门在 Win11 build 26300 实测无效 (OSD 重置前后/重启后写入均被拒), 已移除。
+_BR_MIN_QUALITY = 50   # 画质优先 (线性) 模式下限
+_BR_MIN_DEEP = 25      # 深度调暗 (幂曲线) 模式下限: 20-25 为 e 钳位死区, 取 25
+_DIM_MODES = ('quality', 'deep')
 _KELVIN_ANCHORS = [6500, 5000, 4500, 4000, 3400, 2700]  # 热键 ←→ 步进锚点
 _NIGHT_KELVIN = 3400
 _HK_MOD = 0x0002 | 0x0001  # MOD_CONTROL | MOD_ALT
@@ -136,9 +136,7 @@ class Api:
         self.apply_ok = True
         self.hotkeys_ok = False  # 热键线程注册完成后置真值; 全部失败时 get_state 上报供 UI 提示
         self._fade_token = 0     # 夜间渐变代际号: 递增即取消进行中的渐变, 防两条渐变交错
-        self._gdi_unlocked = bool(display.is_gdi_unlocked())
-        # gamma 调光模型: 解禁优先线性 (重启生效后无对比度畸变); 会话键未生效时写入被拒自动回退幂曲线
-        self._gamma_mode = 'linear' if self._gdi_unlocked else 'power'
+        self.dim_mode = 'deep'   # 'quality'=线性零畸变 (50-100) / 'deep'=幂曲线可调暗 (25-100); _load 恢复
         self._night_applied = None
         self._hidden = False
         self._exiting = False
@@ -184,10 +182,13 @@ class Api:
         """恢复持久化值; 坏 JSON/坏值整体回退默认, 不抛异常"""
         try:
             d = load_state() or {}
+            mode = d.get('dim_mode')
+            if mode in _DIM_MODES:
+                self.dim_mode = mode
             for k in ('brightness', 'r', 'g', 'b', 'contrast'):
                 if k in d:
                     self.values[k] = max(0, min(100, int(d[k])))
-            # 亮度恢复须钳到当前引擎下限 (_gdi_unlocked 在 __init__ 中先于本方法求值)
+            # 亮度恢复须钳到当前模式下限 (dim_mode 已先恢复, _br_min 可用)
             self.values['brightness'] = max(self._br_min(), self.values['brightness'])
             if 'kelvin' in d:
                 self.values['kelvin'] = max(2000, min(6500, int(d['kelvin'])))
@@ -208,30 +209,29 @@ class Api:
     def _save(self):
         d = dict(self.values)
         d['device'] = self.target['device']
+        d['dim_mode'] = self.dim_mode
         save_state(d)
 
     # ---------- 应用 ----------
     def _br_min(self):
-        """亮度下限: DDC 引擎不受 GDI 限制 → 0; 伽马引擎由 GDI 解禁状态决定"""
+        """亮度下限: DDC 引擎不受 GDI 限制 → 0; 伽马引擎由调光模式决定 (50%/25% 均为包络硬墙)"""
         if self.engine == 'ddc':
             return 0
-        return _BR_MIN_UNLOCKED if self._gdi_unlocked else _BR_MIN_LOCKED
+        return _BR_MIN_QUALITY if self.dim_mode == 'quality' else _BR_MIN_DEEP
+
+    def _gamma_ramp_mode(self):
+        """dim_mode → make_ramp 的 mode 参数"""
+        return 'linear' if self.dim_mode == 'quality' else 'power'
 
     def _apply_gamma(self):
         """伽马写入; 记录系统是否接受 (apply_ok 供 UI 提示) → bool
-        解禁态优先线性模型 (重启后生效); 写入被拒说明本会话键未生效, 自动回退幂曲线"""
+        两个模式的 ramp 均设计在 GDI 偏离包络内, 正常必收; 被拒时置 apply_ok 供 UI 提示"""
         if self.engine != 'gamma' or not self.hdc:
             return False
         ramp = display.make_ramp(self.values['brightness'], self.values['kelvin'],
-                                 mode=self._gamma_mode)
-        if not display.set_gamma(self.hdc, ramp) and self._gamma_mode == 'linear':
-            self._gamma_mode = 'power'  # 键写了但本会话未生效 (需重启) → 回退幂曲线
-            ramp = display.make_ramp(self.values['brightness'], self.values['kelvin'],
-                                     mode='power')
-            self.apply_ok = bool(display.set_gamma(self.hdc, ramp))
-            return self.apply_ok
-        self.apply_ok = True
-        return True
+                                 mode=self._gamma_ramp_mode())
+        self.apply_ok = bool(display.set_gamma(self.hdc, ramp))
+        return self.apply_ok
 
     def _apply_ddc(self, only=None):
         """DDC 写入; only='kelvin' 时只写 RGB 增益 (夜间渐变用, 跳过亮度/对比度) → bool"""
@@ -279,7 +279,7 @@ class Api:
                     elif self.engine == 'gamma' and self.hdc:
                         expect = display.make_ramp(self.values['brightness'],
                                                    self.values['kelvin'],
-                                                   mode=self._gamma_mode)
+                                                   mode=self._gamma_ramp_mode())
                         got = display.get_gamma(self.hdc)
                         # 容差比对: 逐项偏差 ≤2 视为一致 (避免量化噪声误判); 长度不等/读到 None 按被重置处理
                         if (got is None or len(got) != len(expect)
@@ -487,11 +487,10 @@ class Api:
     def get_state(self):
         autostart = _autostart_enabled()  # reg query 子进程不读共享态 → 移出锁, 避免占锁等 IO
         with self.lock:
-            self._gdi_unlocked = bool(display.is_gdi_unlocked())
             snap = {'engine': self.engine,
                     'values': dict(self.values),
                     'apply_ok': bool(self.apply_ok),
-                    'gdi_unlocked': self._gdi_unlocked,
+                    'dim_mode': self.dim_mode,
                     'br_min': self._br_min(),
                     'hotkeys_ok': bool(self.hotkeys_ok),
                     'monitor': {'device': self.target['device'], 'rect': self.target['rect']},
@@ -545,24 +544,18 @@ class Api:
         self._sync_ui()
         return {'ok': True, 'state': self.get_state()}
 
-    def unlock_gdi(self):
-        """UAC 提权写 HKLM GdiIcmGammaRange=1, 解除伽马峰值约束 (亮度下限 25→1)"""
-        if not display.is_gdi_unlocked():
-            rc = shell32.ShellExecuteW(None, 'runas', 'reg.exe', _ICM_REG_ADD, None, 0)
-            if rc <= 32:
-                return {'ok': False, 'unlocked': bool(display.is_gdi_unlocked()),
-                        'msg': '提权被取消或失败'}
-            # ShellExecute 启动即返回 → 轮询复核注册表生效 (最多 15×200ms = 3s)
-            for _ in range(15):
-                time.sleep(0.2)
-                if display.is_gdi_unlocked():
-                    break
-            else:
-                return {'ok': False, 'unlocked': bool(display.is_gdi_unlocked()),
-                        'msg': '写入未生效，可能需要重开面板刷新'}
+    def set_dim_mode(self, mode):
+        """切换调光模式: 'quality'=线性零畸变 (下限 50%) / 'deep'=幂曲线可调暗 (下限 25%)
+        模式间画面观感不同 (同为 60% 时画质模式更暗更素), 切换即应用并持久化"""
+        if mode not in _DIM_MODES:
+            return {'ok': False}
         with self.lock:
-            self._gdi_unlocked = bool(display.is_gdi_unlocked())
-        return {'ok': self._gdi_unlocked, 'unlocked': self._gdi_unlocked}
+            self.dim_mode = mode
+            self.values['brightness'] = max(self._br_min(), self.values['brightness'])
+            ok = self._apply_current()
+        self._save()
+        self._sync_ui()
+        return {'ok': True, 'apply_ok': bool(ok), 'dim_mode': mode}
 
     def set_autostart(self, enable):
         if enable:

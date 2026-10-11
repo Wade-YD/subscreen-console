@@ -4,7 +4,6 @@
 import ctypes
 import math
 import time
-import winreg
 from ctypes import wintypes as wt
 
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -139,17 +138,6 @@ def make_ramp(brightness, kelvin=6500, mode='power'):
         f = min(g, max(g * gain, floor))
         ramp.extend(min(65535, max(0, round(65535.0 * f * (i / 255.0) ** e))) for i in range(256))
     return ramp
-
-
-def is_gdi_unlocked():
-    """注册表 GdiIcmGammaRange==1 → 已解除 SetDeviceGammaRamp 半程 (32768) 下限"""
-    try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
-                            r'SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM') as key:
-            val, _typ = winreg.QueryValueEx(key, 'GdiIcmGammaRange')
-            return val == 1
-    except Exception:
-        return False
 
 
 # ---------- DDC/CI (硬件级, 屏支持时使用) ----------
