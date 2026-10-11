@@ -137,6 +137,8 @@ class Api:
         self.hotkeys_ok = False  # 热键线程注册完成后置真值; 全部失败时 get_state 上报供 UI 提示
         self._fade_token = 0     # 夜间渐变代际号: 递增即取消进行中的渐变, 防两条渐变交错
         self._gdi_unlocked = bool(display.is_gdi_unlocked())
+        # gamma 调光模型: 解禁优先线性 (重启生效后无对比度畸变); 会话键未生效时写入被拒自动回退幂曲线
+        self._gamma_mode = 'linear' if self._gdi_unlocked else 'power'
         self._night_applied = None
         self._hidden = False
         self._exiting = False
@@ -216,10 +218,20 @@ class Api:
         return _BR_MIN_UNLOCKED if self._gdi_unlocked else _BR_MIN_LOCKED
 
     def _apply_gamma(self):
-        """伽马写入; 记录系统是否接受 (apply_ok 供 UI 提示) → bool"""
-        self.apply_ok = bool(display.set_gamma(
-            self.hdc, display.make_ramp(self.values['brightness'], self.values['kelvin'])))
-        return self.apply_ok
+        """伽马写入; 记录系统是否接受 (apply_ok 供 UI 提示) → bool
+        解禁态优先线性模型 (重启后生效); 写入被拒说明本会话键未生效, 自动回退幂曲线"""
+        if self.engine != 'gamma' or not self.hdc:
+            return False
+        ramp = display.make_ramp(self.values['brightness'], self.values['kelvin'],
+                                 mode=self._gamma_mode)
+        if not display.set_gamma(self.hdc, ramp) and self._gamma_mode == 'linear':
+            self._gamma_mode = 'power'  # 键写了但本会话未生效 (需重启) → 回退幂曲线
+            ramp = display.make_ramp(self.values['brightness'], self.values['kelvin'],
+                                     mode='power')
+            self.apply_ok = bool(display.set_gamma(self.hdc, ramp))
+            return self.apply_ok
+        self.apply_ok = True
+        return True
 
     def _apply_ddc(self, only=None):
         """DDC 写入; only='kelvin' 时只写 RGB 增益 (夜间渐变用, 跳过亮度/对比度) → bool"""
@@ -266,7 +278,8 @@ class Api:
                         rebuilt = True
                     elif self.engine == 'gamma' and self.hdc:
                         expect = display.make_ramp(self.values['brightness'],
-                                                   self.values['kelvin'])
+                                                   self.values['kelvin'],
+                                                   mode=self._gamma_mode)
                         got = display.get_gamma(self.hdc)
                         # 容差比对: 逐项偏差 ≤2 视为一致 (避免量化噪声误判); 长度不等/读到 None 按被重置处理
                         if (got is None or len(got) != len(expect)

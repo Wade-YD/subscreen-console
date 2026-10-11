@@ -113,22 +113,26 @@ def get_kelvin_gain(kelvin):
     return (r / m, g / m, b / m)
 
 
-def make_ramp(brightness, kelvin=6500):
-    """亮度 (1..100) 与色温 (2000..6500K) → 768 项幂曲线 LUT
+def make_ramp(brightness, kelvin=6500, mode='power'):
+    """亮度 (1..100) 与色温 (2000..6500K) → 768 项 LUT
 
-    模型: p = clamp(100/亮度 - 1, 0, 4); 增益 g = 亮度*(p+1)/100
-          曲线指数 e = min(p+1, 4)   (实测无特权 GDI 包络: e<=4 接受, >=4.5 拒)
-          out(i) = round(65535 * f_c * (i/255)^e),  f_c = g * gain_c
-    无特权 GDI 还有逐通道半程下限 (每通道峰值须 >= 32768): f_c < 0.501 时抬到
-    0.501 (不超过 g); 已解禁 (GdiIcmGammaRange=1) 则不抬, 保留完整色温增益
-    注意: 峰值达标只是必要条件——实测无特权下"陡曲线不允许峰值缩水",
-    e=4 且 g<1 的组合仍会被拒, 故锁定态可用下限为 25 (b=20..25 输出同一 ramp)
+    mode='linear' (需 GdiIcmGammaRange 已在本会话生效): e=1, g=亮度/100 ——
+          白位=设定值 (背光语义), 黑位不动, 灰阶等比缩放 → 不动对比度
+    mode='power' (未解禁/键未生效会话的回退): 幂曲线保"白位恒满 65535" ——
+          GDI 对 ramp 有每点偏离 identity 上限 (~±32768) 的校验: 白位降到半程
+          以下即触限被拒, 只能压中间调, 代价是暗部压缩的对比感损失;
+          f_c < 0.501 逐通道抬底 (不超过 g)
+    out(i) = round(65535 * f_c * (i/255)^e), f_c = g * gain_c
     """
     br = max(1, min(100, int(brightness)))
-    p = max(0.0, min(4.0, 100.0 / br - 1.0))
-    g = br * (p + 1.0) / 100.0
-    e = min(p + 1.0, 4.0)
-    floor = 0.0 if is_gdi_unlocked() else 0.501
+    if mode == 'linear':
+        e = 1.0
+        g = br / 100.0
+        floor = 0.0
+    else:
+        e = min(100.0 / br, 4.0)
+        g = 1.0
+        floor = 0.501
     kr, kg, kb = get_kelvin_gain(kelvin)
     ramp = []
     for gain in (kr, kg, kb):
