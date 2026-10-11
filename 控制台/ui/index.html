@@ -42,6 +42,7 @@
   #log{font-size:11px; color:var(--yellow); min-height:16px; margin-top:8px; word-break:break-all;}
   .hidden{display:none;}
   .note{font-size:11px; color:var(--sub); margin-top:12px; line-height:1.5;}
+  #hotkeyWarn{display:block; color:var(--peach); font-weight:600; margin-top:4px;}
 </style>
 </head>
 <body>
@@ -70,7 +71,7 @@
 
 <section>
   <div class="row"><span class="name">亮度</span><span class="val" id="vBr">100%</span></div>
-  <input type="range" id="sBr" min="20" max="100" value="100">
+  <input type="range" id="sBr" min="1" max="100" value="100">
   <div id="contrastBox" class="hidden">
     <div class="row" style="margin-top:10px"><span class="name">对比度</span><span class="val" id="vCt">100%</span></div>
     <input type="range" id="sCt" min="0" max="100" value="100">
@@ -90,12 +91,12 @@
 
 <button class="ghost" id="btnReset">恢复默认（亮度 100 / 色温 6500K）</button>
 <div id="log"></div>
-<div class="note">热键（全局）：Ctrl+Alt+↑/↓ 亮度 ±10 · Ctrl+Alt+←/→ 色温 · Ctrl+Alt+M 触摸开关 · Ctrl+Alt+Q 显示/隐藏面板。关闭窗口 = 最小化到托盘。</div>
+<div class="note">热键（全局）：Ctrl+Alt+↑/↓ 亮度 ±10 · Ctrl+Alt+←/→ 色温 · Ctrl+Alt+M 触摸开关 · Ctrl+Alt+Q 显示/隐藏面板。关闭窗口 = 最小化到托盘。<span id="hotkeyWarn"></span></div>
 
 <script>
 const $ = id => document.getElementById(id);
 const cur = { engine: 'gamma', values: {}, touch: [], touchSel: null,
-              gdi_unlocked: false, apply_ok: true };
+              gdi_unlocked: false, apply_ok: true, hotkeys_ok: true, br_min: 1 };
 const WARN = '⚠ 系统拒绝了本次伽马写入，已回退显示';
 
 function log(m){ $('log').textContent = m || ''; }
@@ -111,7 +112,7 @@ function render(){
   $('contrastBox').classList.toggle('hidden', !ddc);
   $('colorBox').classList.toggle('hidden', ddc);
   const v = cur.values;
-  $('sBr').min = cur.gdi_unlocked ? 1 : 20;   // 亮度下限: 未解禁 20 (实测 b≤19 被 GDI 拒), 解禁后 1
+  $('sBr').min = Math.min(cur.br_min, v.brightness);   // 亮度下限由后端下发 (br_min); 值低于 min 时暂抬 min 保持显示一致
   $('sBr').value = v.brightness; $('vBr').textContent = v.brightness + '%';
   $('sCt').value = v.contrast;   $('vCt').textContent = v.contrast + '%';
   $('sK').value = v.kelvin;      $('vK').textContent = (v.kelvin || 6500) + 'K';
@@ -121,6 +122,8 @@ function render(){
   const u = $('btnUnlock');
   if (cur.gdi_unlocked){ u.disabled = true; u.textContent = '已解锁'; }
   else { u.disabled = false; u.textContent = '解锁深度调光（UAC）'; }
+  $('hotkeyWarn').textContent = cur.hotkeys_ok === false
+    ? '⚠ 全局热键注册失败（可能被核显驱动等占用）' : '';
   renderTouch();
 }
 
@@ -167,6 +170,8 @@ async function refresh(){
     const s = await pywebview.api.get_state();
     cur.engine = s.engine; cur.values = s.values || {}; cur.touch = s.touch;
     cur.gdi_unlocked = !!s.gdi_unlocked; cur.apply_ok = s.apply_ok;
+    cur.hotkeys_ok = s.hotkeys_ok !== false;
+    cur.br_min = (typeof s.br_min === 'number') ? s.br_min : 1;
     renderDisplays(s);
     render();
     if (s.apply_ok === false) log(WARN);

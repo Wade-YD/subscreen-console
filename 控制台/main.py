@@ -63,7 +63,8 @@ _RUN_KEY = r'HKCU\Software\Microsoft\Windows\CurrentVersion\Run'
 _RUN_VALUE = 'SubScreenConsole'
 _ICM_REG_ADD = (r'add "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ICM"'
                 r' /v GdiIcmGammaRange /t REG_DWORD /d 1 /f')
-_BR_MIN_LOCKED = 20    # 未解禁亮度下限: 实测 GDI 两条约束 (单通道峰值≥32768 且陡曲线不允许峰值缩水), b≤19 均被拒, b=20 可过
+_BR_MIN_LOCKED = 25    # 未解禁亮度下限: GDI 两约束 (峰值≥32768、陡曲线不允许峰值缩水) 使 b≤19 被拒;
+                       # 且亮度 20~24 区间 e 被 min(p+1,4) 钳到 4、g 恒 1, ramp 与 25 完全相同 (死区), b≥26 起才有变化, 故取 25
 _BR_MIN_UNLOCKED = 1   # HKLM GdiIcmGammaRange=1 解禁后的下限
 _KELVIN_ANCHORS = [6500, 5000, 4500, 4000, 3400, 2700]  # 热键 ←→ 步进锚点
 _NIGHT_KELVIN = 3400
@@ -133,6 +134,8 @@ class Api:
                        'kelvin': 6500, 'night_mode': False, 'night_kelvin': _NIGHT_KELVIN,
                        'lat': sunset.DEFAULT_LAT, 'lon': sunset.DEFAULT_LON}
         self.apply_ok = True
+        self.hotkeys_ok = False  # 热键线程注册完成后置真值; 全部失败时 get_state 上报供 UI 提示
+        self._fade_token = 0     # 夜间渐变代际号: 递增即取消进行中的渐变, 防两条渐变交错
         self._gdi_unlocked = bool(display.is_gdi_unlocked())
         self._night_applied = None
         self._hidden = False
@@ -176,22 +179,29 @@ class Api:
 
     # ---------- 状态持久化 (注册表) ----------
     def _load(self):
-        d = load_state() or {}
-        for k in ('brightness', 'r', 'g', 'b', 'contrast'):
-            if k in d:
-                self.values[k] = max(0, min(100, int(d[k])))
-        if 'kelvin' in d:
-            self.values['kelvin'] = max(2000, min(6500, int(d['kelvin'])))
-        self.values['night_mode'] = bool(d.get('night_mode', False))
-        if 'night_kelvin' in d:
-            self.values['night_kelvin'] = max(2000, min(6500, int(d['night_kelvin'])))
+        """恢复持久化值; 坏 JSON/坏值整体回退默认, 不抛异常"""
         try:
+            d = load_state() or {}
+            for k in ('brightness', 'r', 'g', 'b', 'contrast'):
+                if k in d:
+                    self.values[k] = max(0, min(100, int(d[k])))
+            # 亮度恢复须钳到当前引擎下限 (_gdi_unlocked 在 __init__ 中先于本方法求值)
+            self.values['brightness'] = max(self._br_min(), self.values['brightness'])
+            if 'kelvin' in d:
+                self.values['kelvin'] = max(2000, min(6500, int(d['kelvin'])))
+            self.values['night_mode'] = bool(d.get('night_mode', False))
+            if 'night_kelvin' in d:
+                self.values['night_kelvin'] = max(2000, min(6500, int(d['night_kelvin'])))
             if 'lat' in d:
                 self.values['lat'] = float(d['lat'])
             if 'lon' in d:
                 self.values['lon'] = float(d['lon'])
-        except (TypeError, ValueError):
-            pass
+        except Exception:
+            for k, v in (('brightness', 100), ('contrast', 100), ('r', 100), ('g', 100),
+                         ('b', 100), ('kelvin', 6500), ('night_mode', False),
+                         ('night_kelvin', _NIGHT_KELVIN),
+                         ('lat', sunset.DEFAULT_LAT), ('lon', sunset.DEFAULT_LON)):
+                self.values[k] = v
 
     def _save(self):
         d = dict(self.values)
@@ -200,7 +210,9 @@ class Api:
 
     # ---------- 应用 ----------
     def _br_min(self):
-        """亮度下限由 GDI 解禁状态决定 (伽马引擎的硬件约束, 统一应用以保持 UI 一致)"""
+        """亮度下限: DDC 引擎不受 GDI 限制 → 0; 伽马引擎由 GDI 解禁状态决定"""
+        if self.engine == 'ddc':
+            return 0
         return _BR_MIN_UNLOCKED if self._gdi_unlocked else _BR_MIN_LOCKED
 
     def _apply_gamma(self):
@@ -209,29 +221,38 @@ class Api:
             self.hdc, display.make_ramp(self.values['brightness'], self.values['kelvin'])))
         return self.apply_ok
 
-    def _apply_ddc(self):
+    def _apply_ddc(self, only=None):
+        """DDC 写入; only='kelvin' 时只写 RGB 增益 (夜间渐变用, 跳过亮度/对比度) → bool"""
         # 色温 → RGB 硬件增益 (get_kelvin_gain 已按最大通道归一化到 1, ×100 后 ≤100)
         rg, gg, bg = display.get_kelvin_gain(self.values.get('kelvin', 6500))
         self.values['r'] = round(rg * 100)
         self.values['g'] = round(gg * 100)
         self.values['b'] = round(bg * 100)
+        only_kelvin = (only == 'kelvin')
+        ok = True
         for key, code in _DDC_MAP:
+            if only_kelvin and key not in ('r', 'g', 'b'):
+                continue
             mx = self.ddc_max.get(key)
-            if mx:
-                display.ddc_write(self.ddc_pm, code, round(self.values[key] / 100 * mx))
+            if mx and not display.ddc_write(self.ddc_pm, code,
+                                            round(self.values[key] / 100 * mx)):
+                ok = False
+        return ok
 
-    def _apply_current(self):
-        """把当前 values 应用到引擎 → bool"""
+    def _apply_current(self, only=None):
+        """把当前 values 应用到引擎 → bool; 伽马分支忽略 only (整条 ramp 一次写)"""
         if self.engine == 'ddc':
-            self._apply_ddc()
-            self.apply_ok = True
-            return True
+            self.apply_ok = self._apply_ddc(only=only)
+            return self.apply_ok
         return self._apply_gamma()
 
     def _watchdog(self):
-        """每 10s: 目标屏被拔 → 换屏重建; 伽马模式 LUT 被系统重置 (睡眠唤醒/切分辨率) → 补涂"""
+        """每 10s: 目标屏被拔 → 换屏重建; 伽马 LUT 被系统重置 (睡眠唤醒/切分辨率) → 补涂;
+        DDC 每 3 个周期 (约 30s) 探活, 连续读失败 → 释放重建"""
+        n = 0
         while True:
             time.sleep(CFG['gamma_watchdog_sec'])
+            n += 1
             rebuilt = False
             try:
                 with self.lock:
@@ -244,9 +265,18 @@ class Api:
                         self._save()
                         rebuilt = True
                     elif self.engine == 'gamma' and self.hdc:
-                        if display.get_gamma(self.hdc) != display.make_ramp(
-                                self.values['brightness'], self.values['kelvin']):
+                        expect = display.make_ramp(self.values['brightness'],
+                                                   self.values['kelvin'])
+                        got = display.get_gamma(self.hdc)
+                        # 容差比对: 逐项偏差 ≤2 视为一致 (避免量化噪声误判); 长度不等/读到 None 按被重置处理
+                        if (got is None or len(got) != len(expect)
+                                or any(abs(a - b) > 2 for a, b in zip(got, expect))):
                             self._apply_gamma()
+                    elif self.engine == 'ddc' and self.ddc_pm and n % 3 == 0:
+                        if display.ddc_read(self.ddc_pm, display.VCP_BRIGHTNESS) is None:
+                            self._release_engine()  # 句柄失效 → 锁内释放重建
+                            self._init_engine()
+                            rebuilt = True
             except Exception:
                 pass
             if rebuilt:
@@ -254,11 +284,13 @@ class Api:
 
     # ---------- 全局热键 (独立线程, daemon) ----------
     def _hotkey_loop(self):
+        ok_ids = []
         for hid, vk in _HOTKEYS:
-            if not user32.RegisterHotKey(None, hid, _HK_MOD, vk):
-                for h2, _v in _HOTKEYS:  # 任一注册失败 (被占用) → 全部放弃, 热键禁用
-                    user32.UnregisterHotKey(None, h2)
-                return
+            if user32.RegisterHotKey(None, hid, _HK_MOD, vk):
+                ok_ids.append(hid)  # 逐个注册: 被占用的跳过, 成功的保留
+        self.hotkeys_ok = len(ok_ids) > 0
+        if not self.hotkeys_ok:
+            return  # 全部被占用 → 热键禁用; get_state().hotkeys_ok=False 供 UI 提示
         msg = wt.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
             if msg.message == _WM_HOTKEY:
@@ -347,14 +379,19 @@ class Api:
         self._night_applied = target
 
     def _fade_kelvin(self, target):
-        """10 步渐变到目标色温 (每步 200ms)"""
+        """10 步渐变到目标色温 (每步 200ms, DDC 下只写色温); 代际号变化即中止"""
+        tok = self._fade_token
         src = int(self.values.get('kelvin', 6500))
         for i in range(1, 11):
+            if self._fade_token != tok:
+                return
             k = int(round(src + (target - src) * i / 10.0))
             with self.lock:
                 self.values['kelvin'] = k
-                self._apply_current()
+                self._apply_current(only='kelvin')
             time.sleep(0.2)
+        if self._fade_token != tok:
+            return
         self._save()
         self._sync_ui()
 
@@ -435,17 +472,20 @@ class Api:
 
     # ---------- JS API ----------
     def get_state(self):
+        autostart = _autostart_enabled()  # reg query 子进程不读共享态 → 移出锁, 避免占锁等 IO
         with self.lock:
             self._gdi_unlocked = bool(display.is_gdi_unlocked())
             snap = {'engine': self.engine,
                     'values': dict(self.values),
                     'apply_ok': bool(self.apply_ok),
                     'gdi_unlocked': self._gdi_unlocked,
-                    'autostart': _autostart_enabled(),
+                    'br_min': self._br_min(),
+                    'hotkeys_ok': bool(self.hotkeys_ok),
                     'monitor': {'device': self.target['device'], 'rect': self.target['rect']},
                     'target_device': self.target['device'],
                     'displays': [{'device': m['device'], 'primary': m['primary']}
                                  for m in self.displays]}
+        snap['autostart'] = autostart
         snap['touch'] = touchctl.find_touch_devices(CFG['touch_hwid'])
         return snap
 
@@ -493,13 +533,20 @@ class Api:
         return {'ok': True, 'state': self.get_state()}
 
     def unlock_gdi(self):
-        """UAC 提权写 HKLM GdiIcmGammaRange=1, 解除伽马峰值约束 (亮度下限 11→1)"""
+        """UAC 提权写 HKLM GdiIcmGammaRange=1, 解除伽马峰值约束 (亮度下限 25→1)"""
         if not display.is_gdi_unlocked():
             rc = shell32.ShellExecuteW(None, 'runas', 'reg.exe', _ICM_REG_ADD, None, 0)
             if rc <= 32:
                 return {'ok': False, 'unlocked': bool(display.is_gdi_unlocked()),
                         'msg': '提权被取消或失败'}
-            time.sleep(0.6)  # ShellExecute 启动即返回, 略等注册表写入后复核
+            # ShellExecute 启动即返回 → 轮询复核注册表生效 (最多 15×200ms = 3s)
+            for _ in range(15):
+                time.sleep(0.2)
+                if display.is_gdi_unlocked():
+                    break
+            else:
+                return {'ok': False, 'unlocked': bool(display.is_gdi_unlocked()),
+                        'msg': '写入未生效，可能需要重开面板刷新'}
         with self.lock:
             self._gdi_unlocked = bool(display.is_gdi_unlocked())
         return {'ok': self._gdi_unlocked, 'unlocked': self._gdi_unlocked}
@@ -524,6 +571,7 @@ class Api:
         with self.lock:
             self.values['night_mode'] = bool(enable)
         self._save()
+        self._fade_token += 1  # 开/关都先取消进行中的渐变, 防两条渐变交错
         if enable:
             self._night_applied = None
             threading.Thread(target=self._night_check, daemon=True).start()  # 立即评估一次
@@ -559,6 +607,7 @@ def main():
         '副屏控制台', UI_FILE, js_api=api, width=w, height=h, x=int(x), y=int(y),
         background_color='#1E1E2E', min_size=(380, 700),
         hidden=('--hidden' in sys.argv))  # 开机自启带 --hidden: 启动即隐藏, 托盘/热键 Q 唤出
+    api._hidden = ('--hidden' in sys.argv)  # 同步显隐标志, 否则首次 Ctrl+Alt+Q 显隐反向
     api.attach_window(window)
     webview.start()
 

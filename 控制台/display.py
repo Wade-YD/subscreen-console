@@ -121,7 +121,8 @@ def make_ramp(brightness, kelvin=6500):
           out(i) = round(65535 * f_c * (i/255)^e),  f_c = g * gain_c
     无特权 GDI 还有逐通道半程下限 (每通道峰值须 >= 32768): f_c < 0.501 时抬到
     0.501 (不超过 g); 已解禁 (GdiIcmGammaRange=1) 则不抬, 保留完整色温增益
-    峰值 = 65535*g: 亮度 >= 11 时 >= 32768, 亮度 100 时为恒等 ramp
+    注意: 峰值达标只是必要条件——实测无特权下"陡曲线不允许峰值缩水",
+    e=4 且 g<1 的组合仍会被拒, 故锁定态可用下限为 25 (b=20..25 输出同一 ramp)
     """
     br = max(1, min(100, int(brightness)))
     p = max(0.0, min(4.0, 100.0 / br - 1.0))
@@ -189,13 +190,3 @@ def ddc_write(handle, code, value):
             return True
         time.sleep(0.15)
     return False
-
-
-def ddc_supported(hmon):
-    arr, _name = get_physical_monitor(hmon)
-    if not arr:
-        return False
-    try:
-        return ddc_read(arr[0].hPhysicalMonitor, VCP_BRIGHTNESS) is not None
-    finally:
-        destroy_physical_monitor(arr)
